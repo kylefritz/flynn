@@ -153,6 +153,8 @@ type Container struct {
 	job       *host.Job
 	l         *LibcontainerBackend
 	done      chan struct{}
+	muxConfig *logmux.Config
+
 	*containerinit.Client
 }
 
@@ -376,6 +378,12 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 		l:    l,
 		job:  job,
 		done: make(chan struct{}),
+		muxConfig: &logmux.Config{
+			AppID:   job.Metadata["flynn-controller.app"],
+			HostID:  l.State.id,
+			JobType: job.Metadata["flynn-controller.type"],
+			JobID:   job.ID,
+		},
 	}
 	if !job.Config.HostNetwork {
 		container.IP, err = l.ipalloc.RequestIP(l.bridgeNet, runConfig.IP)
@@ -778,6 +786,19 @@ func (c *Container) watch(ready chan<- error, buffer host.LogBuffer) error {
 		}
 	}
 
+	notifyOOM, err := c.container.NotifyOOM()
+	if err != nil {
+		log.Error("error subscribing to OOM notifications", "err", err)
+		return err
+	}
+	go func() {
+		logger := c.l.LogMux.Logger(logagg.MsgIDInit, c.muxConfig, "component", "flynn-host")
+		defer logger.Close()
+		for range notifyOOM {
+			logger.Crit("FATAL: a container process was killed due to lack of available memory")
+		}
+	}()
+
 	log.Info("watching for changes")
 	for change := range c.Client.StreamState() {
 		log.Info("state change", "state", change.State.String())
@@ -844,34 +865,27 @@ func (c *Container) followLogs(log log15.Logger, buffer host.LogBuffer) error {
 		return net.FileConn(file)
 	}
 
-	muxConfig := logmux.Config{
-		AppID:   c.job.Metadata["flynn-controller.app"],
-		HostID:  c.l.State.id,
-		JobType: c.job.Metadata["flynn-controller.type"],
-		JobID:   c.job.ID,
-	}
-
 	logStreams := make(map[string]*logmux.LogStream, 3)
 	stdoutR, err := nonblocking(stdout)
 	if err != nil {
 		log.Error("error streaming stdout", "err", err)
 		return err
 	}
-	logStreams["stdout"] = c.l.LogMux.Follow(stdoutR, buffer["stdout"], logagg.MsgIDStdout, muxConfig)
+	logStreams["stdout"] = c.l.LogMux.Follow(stdoutR, buffer["stdout"], logagg.MsgIDStdout, c.muxConfig)
 
 	stderrR, err := nonblocking(stderr)
 	if err != nil {
 		log.Error("error streaming stderr", "err", err)
 		return err
 	}
-	logStreams["stderr"] = c.l.LogMux.Follow(stderrR, buffer["stderr"], logagg.MsgIDStderr, muxConfig)
+	logStreams["stderr"] = c.l.LogMux.Follow(stderrR, buffer["stderr"], logagg.MsgIDStderr, c.muxConfig)
 
 	initLogR, err := nonblocking(initLog)
 	if err != nil {
 		log.Error("error streaming initial log", "err", err)
 		return err
 	}
-	logStreams["initLog"] = c.l.LogMux.Follow(initLogR, buffer["initLog"], logagg.MsgIDInit, muxConfig)
+	logStreams["initLog"] = c.l.LogMux.Follow(initLogR, buffer["initLog"], logagg.MsgIDInit, c.muxConfig)
 	c.l.logStreams[c.job.ID] = logStreams
 
 	return nil
